@@ -1,0 +1,1179 @@
+:- use_module(library(pce)).
+:- use_module(library(random)).
+:- use_module(library(lists)).
+
+% 1. DYNAMIC FACTS
+
+:- dynamic player/8.
+%Store each player's state including position, stamina, and abilities
+:- dynamic ball/2.
+%Store the current ball position and its controller (null if free)           
+:- dynamic score/2.      
+%Store the current score for each team
+:- dynamic round_counter/1.
+%Track the current tick number of the match
+:- dynamic target_tick/1.  
+%Define the tick at which the simulation should stop
+:- dynamic half/1.
+%Store the current half of the match (1 or 2)
+:- dynamic gui_frame/1.
+%Store the main GUI window object
+:- dynamic gui_canvas/1.     
+%Store the drawing surface used for rendering the game
+:- dynamic show_overlay/1.  
+%Control whether an overlay (e.g., halftime screen) is displayed
+:- dynamic sim_timer/1.
+%Store the main repeating timer for the simulation loop
+:- dynamic delay_timer/1.   
+%Store temporary timers used for delayed actions (e.g., after a goal)
+:- dynamic gk_hold_count/2.  
+%Track how long the goalkeeper holds the ball after a save
+:- dynamic home_y/2. 
+%Store each player's original Y-position
+:- dynamic ball_velocity/2.  
+%Store the ball's velocity while it is moving freely
+:- dynamic live_gfx/1.
+%Track all graphical objects drawn in the current frame
+:- dynamic kickoff_team/1.
+%Store which team will perform the next kickoff
+:- dynamic kickoff_done/0.
+%Indicate whether the current kickoff has already been executed
+:- dynamic action_msg/1.
+%Store the latest action message shown in the UI
+:- dynamic goal_delay/0.
+%Indicate a short delay after a goal before resetting play
+:- dynamic protected_msg/0.
+%Prevent action messages from being overwritten during critical events
+:- dynamic tick_busy/0.
+%Prevent overlapping execution of simulation ticks
+:- dynamic halftime_pause/1.
+%Track the remaining pause duration during halftime
+
+% 2. STATIC CONFIG
+
+halftime_tick(45).	%Each half lasts 45 minutes
+
+goal_x(team1, 200).
+goal_x(team2,   0).
+%Define the X-coordinate of each team's goal position
+
+gk_home_x(team1,   3).
+gk_home_x(team2, 197).
+%Define the default (home) X-position of each team's goalkeeper
+
+base_dribble(goalkeeper, 20). base_dribble(backward, 40).
+base_dribble(midfield,   65). base_dribble(forward,  85).
+%Define the base dribbling skill for each player role
+
+base_intercept(goalkeeper, 80). base_intercept(backward, 85).
+base_intercept(midfield,   60). base_intercept(forward,  30).
+%Define the base interception skill for each player role
+
+zone_x(forward,    _,     0, 200).
+zone_x(midfield,   team1, 0, 150). zone_x(midfield,   team2,  50, 200).
+zone_x(backward,   team1, 0, 120). zone_x(backward,   team2,  80, 200).
+zone_x(goalkeeper, team1, 0,  12). zone_x(goalkeeper, team2, 188, 200).	
+%Define the allowed zone(X-range) for each player role and team
+
+role_abbr(goalkeeper, 'GK'). role_abbr(forward,  'FW').
+role_abbr(midfield,   'MF'). role_abbr(backward, 'BK').
+%Define abbreviations for each player role
+
+% 3. HELPERS
+
+% Run a goal without letting it crash the whole simulation.
+safe(Goal) :-
+    ( catch(Goal, _, true) -> true ; true ).
+
+% Update the live action message shown in the header.
+set_msg(Msg) :-
+    ( protected_msg ->
+        true
+    ;
+        retractall(action_msg(_)),
+        assertz(action_msg(Msg))
+    ).
+
+
+
+set_kickoff_msg(Msg) :-
+    retractall(action_msg(_)),
+    assertz(action_msg(Msg)),
+    retractall(protected_msg),
+    assertz(protected_msg).
+
+% Keep a value inside a minimum and maximum range.
+clamp(V, Lo, _, Lo) :- V =< Lo, !.
+clamp(V, _, Hi, Hi) :- V >= Hi, !.
+clamp(V, _, _,  V).
+
+% True when the target X is in front of the team's attacking direction.
+is_front(team1, MyX, TX) :- TX > MyX.
+is_front(team2, MyX, TX) :- TX < MyX.
+
+% Simple lookup for the other side.
+opponent_team(team1, team2).
+opponent_team(team2, team1).
+
+% Add or remove stamina and make sure that the final value between 0 and 100.
+update_stamina(Name, Amt) :-
+    ( retract(player(Name, T, R, Pos, S, Sp, Dr, In)) ->
+        NS is min(100, max(0, S + Amt)),
+        assertz(player(Name, T, R, Pos, NS, Sp, Dr, In))
+    ; true ).
+
+% Rewrite a player's current position.
+update_position(Name, NX, NY) :-
+    ( retract(player(Name, T, R, position(_, _), S, Sp, Dr, In)) ->
+        assertz(player(Name, T, R, position(NX, NY), S, Sp, Dr, In))
+    ; true ).
+
+% Give the vertical lane a player is allowed to run inside since the movement is random.
+% keeps players in their lane.
+y_lane(Name, MinY, MaxY) :-
+    home_y(Name, HY),
+    MinY is max(0,   HY - 25),
+    MaxY is min(140, HY + 25).
+
+% 4. SIDE-SWITCH HELPERS
+
+switched_team(Team, EffTeam) :-
+    ( half(2) -> opponent_team(Team, EffTeam) ; EffTeam = Team ).
+%Determine the effective team based on the current half
+
+effective_goal_x(Team, X) :-
+    switched_team(Team, ET),
+    goal_x(ET, X).
+%Return the X-coordinate of the goal this team is currently attacking
+
+effective_gk_home_x(Team, X) :-
+    switched_team(Team, ET),
+    gk_home_x(ET, X).
+%Return the goalkeeper's home X-position for the current half
+
+effective_zone_x(Role, Team, Min, Max) :-
+    switched_team(Team, ET),
+    zone_x(Role, ET, Min, Max).
+%Return the allowed X-range for a player's role in the current half
+
+effective_is_front(Team, MyX, TX) :-
+    switched_team(Team, ET),
+    is_front(ET, MyX, TX).
+%Check whether TX is in front of MyX based on the team's attack direction
+
+effective_role_support_offset(Role, Team, Offset) :-
+    switched_team(Team, ET),
+    role_support_offset(Role, ET, Offset).
+%Return the support offset for a player's role in the current half
+
+attacks_right(Team) :-
+    effective_is_front(Team, 0, 1).
+%Check whether the team is currently attacking toward increasing X values
+
+% 5. ENTRY POINTS
+
+play :-
+    run_simulation(90).
+%Start a full match
+
+run_simulation(N) :-
+    integer(N),
+    N >= 1,
+    N =< 90,
+    !,
+    init_state(N),
+    open_gui,
+    start_timer.
+%Run the simulation for N ticks
+
+run_simulation(_) :-
+    format("Usage: run_simulation(N) where N is between 1 and 90.~n").
+%If N is invalid, display a usage message
+
+% 6. INITIALISATION
+
+init_state(N) :-
+    free_all_timers,
+    ( gui_frame(OldFr), object(OldFr) ->
+        catch(send(OldFr, clear), _, true),
+        send(OldFr, free)
+    ; true ),
+    retractall(gui_frame(_)),
+    retractall(gui_canvas(_)),
+    retractall(player(_, _, _, _, _, _, _, _)),
+    retractall(ball(_, _)),
+    retractall(score(_, _)),
+    retractall(round_counter(_)),
+    retractall(target_tick(_)),
+    retractall(half(_)),
+    retractall(show_overlay(_)),
+    retractall(gk_hold_count(_, _)),
+    retractall(home_y(_, _)),
+    retractall(kickoff_team(_)),
+    retractall(kickoff_done),
+    retractall(action_msg(_)),
+    retractall(ball_velocity(_, _)),
+    retractall(live_gfx(_)),
+    retractall(goal_delay),
+    retractall(protected_msg),
+    retractall(tick_busy),
+    retractall(halftime_pause(_)),
+    assertz(kickoff_team(team1)),
+    assertz(action_msg('')),
+    assertz(score(team1, 0)),
+    assertz(score(team2, 0)),
+    assertz(ball(position(100, 70), null)),
+    assertz(round_counter(1)),
+    assertz(target_tick(N)),
+    assertz(half(1)),
+    spawn_all_players.
+%Reset the entire simulation state by clearing all previous data and initializing a new match
+
+spawn_all_players :-
+    spawn_player('P1A', team1, goalkeeper,   5,  70,  0),
+    spawn_player('P1B', team1, backward,    35,  45, 45),
+    spawn_player('P1C', team1, backward,    35,  95, 45),
+    spawn_player('P1D', team1, midfield,    70,  35, 65),
+    spawn_player('P1E', team1, midfield,    70, 105, 65),
+    spawn_player('P1F', team1, forward,     90,  55, 85),
+    spawn_player('P1G', team1, forward,     90,  85, 85),
+    spawn_player('P2A', team2, goalkeeper, 195,  70,  0),
+    spawn_player('P2B', team2, backward,   165,  45, 45),
+    spawn_player('P2C', team2, backward,   165,  95, 45),
+    spawn_player('P2D', team2, midfield,   130,  35, 65),
+    spawn_player('P2E', team2, midfield,   130, 105, 65),
+    spawn_player('P2F', team2, forward,    110,  55, 85),
+    spawn_player('P2G', team2, forward,    110,  85, 85).
+%Create all players with their initial positions and attributes
+
+spawn_player(Name, Team, Role, X, Y, Speed) :-
+    base_dribble(Role, Dr),
+    base_intercept(Role, In),
+    assertz(player(Name, Team, Role, position(X, Y), 100, Speed, Dr, In)),
+    assertz(home_y(Name, Y)).
+%Create a player with default attributes and full stamina
+%Store the player's home Y-position for movement constraints
+
+reset_positions :-
+    retractall(kickoff_done),
+    retractall(ball_velocity(_, _)),
+    retractall(ball(_, _)),
+    assertz(ball(position(100, 70), null)),
+    reset_player_pos('P1A',   5,  70),
+    reset_player_pos('P1B',  35,  45),
+    reset_player_pos('P1C',  35,  95),
+    reset_player_pos('P1D',  70,  35),
+    reset_player_pos('P1E',  70, 105),
+    reset_player_pos('P1F',  90,  55),
+    reset_player_pos('P1G',  90,  85),
+    reset_player_pos('P2A', 195,  70),
+    reset_player_pos('P2B', 165,  45),
+    reset_player_pos('P2C', 165,  95),
+    reset_player_pos('P2D', 130,  35),
+    reset_player_pos('P2E', 130, 105),
+    reset_player_pos('P2F', 110,  55),
+    reset_player_pos('P2G', 110,  85).
+%Reset all players to their first-half starting positions
+%Place the ball at the centre and prepare for kickoff
+
+reset_player_pos(Name, X, Y) :-
+    ( retract(player(Name, T, R, _, S, Sp, Dr, In)) ->
+        assertz(player(Name, T, R, position(X, Y), S, Sp, Dr, In))
+    ; true ).
+%Update a player's position while preserving all other attributes
+
+reset_positions_second_half :-
+    retractall(kickoff_done),
+    retractall(ball_velocity(_, _)),
+    retractall(ball(_, _)),
+    assertz(ball(position(100, 70), null)),
+    reset_player_pos('P1A', 195,  70),
+    reset_player_pos('P1B', 165,  45),
+    reset_player_pos('P1C', 165,  95),
+    reset_player_pos('P1D', 130,  35),
+    reset_player_pos('P1E', 130, 105),
+    reset_player_pos('P1F', 110,  55),
+    reset_player_pos('P1G', 110,  85),
+    reset_player_pos('P2A',   5,  70),
+    reset_player_pos('P2B',  35,  45),
+    reset_player_pos('P2C',  35,  95),
+    reset_player_pos('P2D',  70,  35),
+    reset_player_pos('P2E',  70, 105),
+    reset_player_pos('P2F',  90,  55),
+    reset_player_pos('P2G',  90,  85).
+%Reset all players to their mirrored second-half positions
+%Place the ball at the centre and prepare for kickoff
+
+% 7. GUI SETUP
+
+open_gui :-
+    new(W, window('RoboCup Simulation', size(920, 620))),
+    send(W, background, colour(black)),
+    assertz(gui_frame(W)),
+    assertz(gui_canvas(W)),
+    send(W, open),
+    redraw_canvas.
+%Create and initialize the simulation window, then display the first frame
+
+start_timer :-
+    new(T, timer(0.1, message(@prolog, tick_step))),
+    assertz(sim_timer(T)),
+    send(T, start).
+%Create and start the main timer that drives the simulation loop
+
+stop_timers :-
+    forall(sim_timer(T1),   ( object(T1) -> send(T1, stop) ; true )),
+    retractall(sim_timer(_)),
+    forall(delay_timer(T2), ( object(T2) -> send(T2, stop) ; true )),
+    retractall(delay_timer(_)).
+%Stop all active timers without freeing their memory
+
+free_all_timers :-
+    forall(sim_timer(T1),   ( object(T1) -> send(T1, stop), send(T1, free) ; true )),
+    retractall(sim_timer(_)),
+    forall(delay_timer(T2), ( object(T2) -> send(T2, stop), send(T2, free) ; true )),
+    retractall(delay_timer(_)).
+ %Stop and free all timer objects to fully release resources
+
+% 8. TICK LOOP
+% The timer calls this loop again and again.
+% One tick means one small step of match’s time.
+
+
+
+% The busy flag prevents accidental double-fires.
+tick_step :-
+    ( tick_busy ->
+        true
+    ;
+        assertz(tick_busy),
+        ( catch(do_tick_step, _, true) -> true ; true ),
+        retractall(tick_busy)
+    ).
+
+
+% Main flow for a single tick.
+% It decides whether we are in normal play, halftime pause, or goal delay.
+do_tick_step :-
+    retractall(protected_msg),
+    ( show_overlay(halftime) ->
+        handle_halftime_pause
+    ;
+        round_counter(Tick),
+        halftime_tick(HT),
+        target_tick(Target),
+        ( Tick > Target ->
+            stop_timers,
+            redraw_canvas
+        ; goal_delay ->
+            safe(advance_ball),
+            redraw_canvas
+        ;
+            safe(simulate_round),
+            ( Tick >= HT, half(1), Target > HT ->
+                retractall(show_overlay(_)),
+                assertz(show_overlay(halftime)),
+                retractall(halftime_pause(_)),
+                assertz(halftime_pause(20)),
+                redraw_canvas
+            ;
+                redraw_canvas,
+                NextTick is Tick + 1,
+                retractall(round_counter(_)),
+                assertz(round_counter(NextTick))
+            )
+        )
+    ).
+
+% While halftime is showing, the main timer still runs but gameplay stays frozen.
+% Keep showing halftime until the pause finishes, then switch to second-half.
+handle_halftime_pause :-
+    ( halftime_pause(N), N > 0 ->
+        N1 is N - 1,
+        retractall(halftime_pause(_)),
+        assertz(halftime_pause(N1)),
+        redraw_canvas
+    ;
+        retractall(halftime_pause(_)),
+        safe(do_halftime),
+        retractall(show_overlay(_)),
+        redraw_canvas
+    ).
+
+% 9. HALFTIME FLOW
+% Everything that happens during the first half and second half is handled here.
+% Apply all halftime effects: refill stamina, flip sides, reset positions, and set the next kickoff.
+
+do_halftime :-
+    restore_all_stamina,
+    retractall(goal_delay),
+    retractall(gk_hold_count(_, _)),
+    retractall(ball_velocity(_, _)),
+    retractall(half(_)),
+    assertz(half(2)),
+    reset_positions_second_half,
+    retractall(round_counter(_)),
+    assertz(round_counter(46)),
+    retractall(kickoff_team(_)),
+    retractall(kickoff_done),
+    retractall(action_msg(_)),
+    assertz(action_msg('')),
+    assertz(kickoff_team(team2)).
+
+% Refill every player's stamina back to 100.
+restore_all_stamina :-
+    findall(N, player(N, _, _, _, _, _, _, _), Names),
+    restore_stamina_list(Names).
+
+
+%  refills stamina one player at a time.
+restore_stamina_list([]).
+restore_stamina_list([Name | Rest]) :-
+    ( retract(player(Name, T, R, Pos, _, Sp, Dr, In)) ->
+        assertz(player(Name, T, R, Pos, 100, Sp, Dr, In))
+    ; true ),
+    restore_stamina_list(Rest).
+
+
+% 10. ONE MATCH TICK OF GAMEPLAY
+% Describes what happens during one gameplay tick.
+
+% Run one normal gameplay tick, kickoff if needed, goalkeeper reactions, ball movement, player logic, then goal check.
+simulate_round :-
+    ( kickoff_done -> true ; safe(do_kickoff) ),
+    safe(gk_respond_to_ball(team1)),
+    safe(gk_respond_to_ball(team2)),
+    safe(advance_ball),
+    findall(t(Nm, Tm, Rl, Pos, St, Sp, Dr, In),
+            player(Nm, Tm, Rl, Pos, St, Sp, Dr, In),
+            Players),
+    process_all(Players),
+    safe(check_goal).
+
+% process each player for each tick passed .
+process_all([]).
+process_all([t(Nm, Tm, Rl, Pos, St, Sp, Dr, In) | Rest]) :-
+    safe(process_player(Nm, Tm, Rl, Pos, St, Sp, Dr, In)),
+    process_all(Rest).
+
+% Closest forward takes the kickoff, then sends the ball to the next one.
+do_kickoff :-
+    assertz(kickoff_done),
+    kickoff_team(KOTeam),
+    findall(D-Name-X-Y,
+        ( player(Name, KOTeam, forward, position(X, Y), _, _, _, _),
+          D is sqrt((X - 100) * (X - 100) + (Y - 70) * (Y - 70))
+        ),
+        Fwds),
+    msort(Fwds, Sorted),
+    ( Sorted = [_-Kicker-KStartX-KStartY | Rest] ->
+        update_position(Kicker, 100, 70),
+        ( Rest = [_-Receiver-RX-RY | _] ->
+            XDiff is RX - 100,
+            YDiff is RY - 70,
+            Dist is max(0.0001, sqrt(XDiff * XDiff + YDiff * YDiff)),
+            VX is XDiff / Dist * 8,
+            VY is YDiff / Dist * 8,
+            retractall(ball_velocity(_, _)),
+            retractall(ball(_, _)),
+            assertz(ball_velocity(VX, VY)),
+            assertz(ball(position(100, 70), null)),
+            update_position(Kicker, KStartX, KStartY),
+            atomic_list_concat([Kicker, ' ->', Receiver, ' kickoff pass!'], M)
+        ;
+            retractall(ball_velocity(_, _)),
+            retractall(ball(_, _)),
+            assertz(ball(position(100, 70), Kicker)),
+            atomic_list_concat([Kicker, ' kicks off!'], M)
+        ),
+        set_kickoff_msg(M)
+    ; true ).
+
+% If the keeper just made a save, stay still until the hold timer expires.
+gk_respond_to_ball(Team) :-
+    gk_hold_count(Team, N),
+    N > 0,
+    !.
+
+% Otherwise the keeper only reacts when the ball enters the keeper zone.
+gk_respond_to_ball(Team) :-
+    ball(position(BX, BY), _),
+    effective_zone_x(goalkeeper, Team, MinX, MaxX),
+    ( BX >= MinX, BX =< MaxX ->
+        effective_gk_home_x(Team, HomeX),
+        ( player(GKName, Team, goalkeeper, position(_, GKY), _, _, _, _) ->
+            DY is BY - GKY,
+            StepY is max(-3, min(3, DY)),
+            NewY is GKY + StepY,
+            y_lane(GKName, MinY, MaxY),
+            clamp(NewY, MinY, MaxY, ClampedY),
+            update_position(GKName, HomeX, ClampedY)
+        ; true )
+    ;
+        effective_gk_home_x(Team, HomeX),
+        ( player(GKName, Team, goalkeeper, position(_, GKY), _, _, _, _) ->
+            home_y(GKName, HomeGKY),
+            DY is HomeGKY - GKY,
+            StepY is max(-2, min(2, DY)),
+            NewY is GKY + StepY,
+            update_position(GKName, HomeX, NewY)
+        ; true )
+    ).
+
+
+% 11. PLAYER DECISION LOGIC
+%main priority system for each player.
+
+
+% Main decision tree for one player.
+process_player(Name, Team, goalkeeper, position(GX, GY), _St, _Sp, _Dr, _In) :-
+    gk_hold_count(Team, N),
+    N > 0,
+    !,
+    retractall(ball_velocity(_, _)),
+    retractall(ball(_, _)),
+    assertz(ball(position(GX, GY), Name)),
+    retract(gk_hold_count(Team, N)),
+    N1 is N - 1,
+    ( N1 > 0 -> assertz(gk_hold_count(Team, N1)) ; true ),
+    atomic_list_concat([Name, ' holds the ball'], HM),
+    set_msg(HM),
+    update_stamina(Name, -1).
+
+process_player(Name, _Team, _Role, _Pos, St, _Sp, _Dr, _In) :-
+    St < 5,
+    !,
+    update_stamina(Name, 2).
+
+process_player(Name, Team, goalkeeper, position(X, Y), _St, _Sp, _Dr, _In) :-
+    ball(_, Name),
+    !,
+    ( catch(gk_distribute(Team, X, Y), _, fail) ->
+        update_stamina(Name, -1)
+    ;
+        update_stamina(Name, 2)
+    ).
+
+process_player(Name, Team, Role, position(X, Y), _St, Sp, Dr, _In) :-
+    Role \= goalkeeper,
+    ball(_, Name),
+    !,
+    handle_dribble(Name, Team, Role, X, Y, Sp, Dr).
+
+process_player(Name, Team, Role, position(X, Y), _St, _Sp, _Dr, In) :-
+    Role \= goalkeeper,
+    ball(position(BX, BY), _),
+    Dist is sqrt((X - BX) * (X - BX) + (Y - BY) * (Y - BY)),
+    Dist =< 8,
+    !,
+    try_intercept(Name, Team, In).
+
+process_player(Name, Team, Role, position(X, Y), _St, Sp, _Dr, _In) :-
+    Role \= goalkeeper,
+    move_without_ball(Name, Team, Role, X, Y, Sp).
+
+process_player(_, _, _, _, _, _, _, _).
+
+
+% 12. GOALKEEPER HELPERS
+% Extra goalkeeper logic 
+
+% Safer options are teammates with no opponent within 15 units.
+% priority is backward -> midfield -> forward.
+% Find a teammate who is safe enough for the goalkeeper to pass to.
+gk_safe_candidate(Team, Opp, Score-TName-TX-TY) :-
+    player(TName, Team, Role, position(TX, TY), _, _, _, _),
+    Role \= goalkeeper,
+    \+ ( player(_, Opp, _, position(OX, OY), _, _, _, _),
+         Dist is sqrt((OX - TX) * (OX - TX) + (OY - TY) * (OY - TY)),
+         Dist =< 15 ),
+    ( Role = backward  -> Score = 0
+    ; Role = midfield  -> Score = 1
+    ;                     Score = 2 ).
+
+
+% Pick a safe receiver and restart play from the goalkeeper.
+gk_distribute(Team, FromX, FromY) :-
+    opponent_team(Team, Opp),
+    findall(Score-TName-TX-TY,
+        gk_safe_candidate(Team, Opp, Score-TName-TX-TY),
+        SafeCands),
+    ( SafeCands \= [] ->
+        msort(SafeCands, SortedSafe),
+        SortedSafe = [_-RecvName-RX-RY | _]
+    ;
+        findall(D-TName-TX-TY,
+            ( player(TName, Team, Role, position(TX, TY), _, _, _, _),
+              Role \= goalkeeper,
+              D is sqrt((TX - FromX) * (TX - FromX) + (TY - FromY) * (TY - FromY))
+            ),
+            AllCands),
+        AllCands \= [],
+        msort(AllCands, AllSorted),
+        AllSorted = [_-RecvName-RX-RY | _]
+    ),
+   
+    shoot_ball(FromX, FromY, RX, RY, RecvName),
+    atomic_list_concat(['GK distributes  -> ', RecvName], M),
+    set_msg(M).
+
+
+% 13. ATTACK LOGIC
+% Dribbling, shooting, passing, and ball travel are handled here.
+
+% Decide what a player with the ball should do next: shoot, pass, or keep dribbling.
+handle_dribble(Name, Team, Role, X, Y, Speed, Dr) :-
+    opponent_team(Team, Opp),
+    findall(IC,
+        ( player(_, Opp, _, position(OX, OY), _, _, _, IC),
+          Dst is sqrt((OX - X) * (OX - X) + (OY - Y) * (OY - Y)),
+          Dst =< 6
+        ),
+        Threats),
+    ( Threats \= [] -> max_list(Threats, MaxThreat) ; MaxThreat = 0 ),
+    effective_zone_x(Role, Team, MinX, MaxX),
+    ( attacks_right(Team) ->
+        ( X >= MaxX -> IsAtLimit = true ; IsAtLimit = false )
+    ;
+        ( X =< MinX -> IsAtLimit = true ; IsAtLimit = false )
+    ),
+    effective_goal_x(Team, GX),
+    Dist2Goal is abs(X - GX),
+    ( (Role = forward,  Dist2Goal =< 55) -> InShootZone = true
+    ; (Role = midfield, Dist2Goal =< 30) -> InShootZone = true
+    ;                                       InShootZone = false
+    ),
+    ( InShootZone = true ->
+        do_shoot(Team),
+        atomic_list_concat([Name, ' shoots!'], SM),
+        set_msg(SM),
+        update_stamina(Name, -1)
+    ; ( MaxThreat > Dr ; IsAtLimit = true ) ->
+        ( find_forward_pass(Team, X, Y, TName, TX, TY) ->
+            shoot_ball(X, Y, TX, TY, TName),
+            atomic_list_concat([Name, ' passes  -> ', TName], PM),
+            set_msg(PM),
+            update_stamina(Name, -1)
+        ;
+            do_shoot(Team),
+            atomic_list_concat([Name, ' shoots!'], SM2),
+            set_msg(SM2),
+            update_stamina(Name, -1)
+        )
+    ;
+        dribble_move(Name, Team, Role, X, Y, Speed)
+    ).
+
+% Advance a player with the ball toward goal while staying inside their zone.
+dribble_move(Name, Team, Role, X, Y, Speed) :-
+    effective_goal_x(Team, GX),
+    Steps is max(1, round(Speed * 0.7 / 10)),
+    XDiff is GX - X,
+    AbsX is abs(XDiff),
+    ( AbsX < 0.001 ->
+        NX0 = X
+    ;
+        Dir is XDiff / AbsX,
+        NX0 is X + round(Dir * Steps)
+    ),
+    y_lane(Name, MinY, MaxY),
+    random(-5, 6, YNoise),
+    NY0 is Y + YNoise,
+    clamp(NY0, MinY, MaxY, NewY),
+    effective_zone_x(Role, Team, MinX, MaxX),
+    clamp(NX0, MinX, MaxX, NewX),
+    update_position(Name, NewX, NewY),
+    retractall(ball_velocity(_, _)),
+    retractall(ball(_, _)),
+    assertz(ball(position(NewX, NewY), Name)),
+    update_stamina(Name, -2).
+
+
+% Turn the current ball into a rolling shot toward the goal mouth.
+do_shoot(Team) :-
+    effective_goal_x(Team, GX),
+    random(-15, 16, YNoise),
+    RawY is 70 + YNoise,
+    clamp(RawY, 50, 90, TargetY),
+    ball(position(BX, BY), _),
+    XDiff is GX - BX,
+    YDiff is TargetY - BY,
+    Dist is max(0.0001, sqrt(XDiff * XDiff + YDiff * YDiff)),
+    ShotSpeed = 8,
+    VX is XDiff / Dist * ShotSpeed,
+    VY is YDiff / Dist * ShotSpeed,
+    retractall(ball_velocity(_, _)),
+    assertz(ball_velocity(VX, VY)),
+    retractall(ball(_, _)),
+    assertz(ball(position(BX, BY), null)).
+
+
+% Move a rolling ball one step using its saved velocity.
+advance_ball :-
+    ball_velocity(VX, VY),
+    ball(position(BX, BY), null),
+    !,
+    NBX is BX + VX,
+    NBY is BY + VY,
+    clamp(NBX, -20, 220, FBX0),
+    clamp(NBY,   0, 140, FBY0),
+    FBX is round(FBX0),
+    FBY is round(FBY0),
+    retractall(ball(_, _)),
+    assertz(ball(position(FBX, FBY), null)),
+    ( (FBX =< -20 ; FBX >= 220 ; FBY =:= 0 ; FBY =:= 140) ->
+        retractall(ball_velocity(_, _))
+    ; true ).
+advance_ball.
+
+
+% Place the ball toward a target instantly and assign control to the intended receiver.
+shoot_ball(X, Y, TX, TY, Controller) :-
+    XDiff is TX - X,
+    YDiff is TY - Y,
+    Dist is max(0.0001, sqrt(XDiff * XDiff + YDiff * YDiff)),
+    NBX is round(X + (XDiff / Dist) * 8),
+    NBY is round(Y + (YDiff / Dist) * 8),
+    clamp(NBX, 0, 200, FBX),
+    clamp(NBY, 0, 140, FBY),
+    retractall(ball_velocity(_, _)),
+    retractall(ball(_, _)),
+    assertz(ball(position(FBX, FBY), Controller)).
+
+% Look for the nearest teammate who is ahead of the current ball carrier.
+find_forward_pass(Team, X, Y, TName, TX, TY) :-
+    findall(D-PN-PX-PY,
+        ( player(PN, Team, _, position(PX, PY), _, _, _, _),
+          effective_is_front(Team, X, PX),
+          D is sqrt((PX - X) * (PX - X) + (PY - Y) * (PY - Y))
+        ),
+        Candidates),
+    Candidates \= [],
+    msort(Candidates, [_-TName-TX-TY | _]).
+
+
+%14. INTERCEPTS / TACKLES
+% This section decides when a player can take the ball.
+
+
+% Try to take the ball
+try_intercept(Name, Team, In) :-
+    ball(position(BX, BY), Controller),
+    ( Controller = null ->
+        retractall(ball_velocity(_, _)),
+        retractall(ball(_, _)),
+        assertz(ball(position(BX, BY), Name)),
+        update_stamina(Name, -1)
+    ;
+        ( player(Controller, OwnerTeam, _, _, _, _, OwnerDr, _),
+          OwnerTeam \= Team,
+          \+ ( player(Controller, OwnerTeam, goalkeeper, _, _, _, _, _),
+               gk_hold_count(OwnerTeam, HC),
+               HC > 0 ),
+          TackleChance is max(10, min(90, 50 + In - OwnerDr)),
+          random(0, 100, R),
+          R < TackleChance ->
+            retractall(ball_velocity(_, _)),
+            retractall(ball(_, _)),
+            assertz(ball(position(BX, BY), Name)),
+            atomic_list_concat([Name, ' wins the ball from ', Controller, '!'], M),
+            set_msg(M),
+            update_stamina(Name, -1)
+        ;
+            true
+        )
+    ).
+
+% 15. OFF-BALL MOVEMENT
+% Players without the ball re position themselves here.
+
+
+% Small X offsets stop every role from piling onto the same point.
+
+role_support_offset(forward,    team1,  12).
+role_support_offset(forward,    team2, -12).
+role_support_offset(midfield,   team1,   0).
+role_support_offset(midfield,   team2,   0).
+role_support_offset(backward,   team1, -14).
+role_support_offset(backward,   team2,  14).
+
+
+% Re position a player who does not have the ball.
+
+move_without_ball(Name, Team, Role, X, Y, Speed) :-
+    ball(position(BX, _), _),
+    effective_zone_x(Role, Team, MinX, MaxX),
+    ( (BX > MaxX ; BX < MinX) ->
+        update_stamina(Name, 2)
+    ;
+        home_y(Name, HomeY),
+        effective_role_support_offset(Role, Team, Offset),
+        RawTargetX is BX + Offset,
+        ( Role = backward ->
+            ( attacks_right(Team) ->
+                FlooredX is max(30, RawTargetX)
+            ;
+                FlooredX is min(170, RawTargetX)
+            ),
+            clamp(FlooredX, MinX, MaxX, TargetX)
+        ;
+            clamp(RawTargetX, MinX, MaxX, TargetX)
+        ),
+        Steps is max(1, round(Speed / 10)),
+        XDiff is TargetX - X,
+        YDiff is HomeY - Y,
+        Dist is max(0.0001, sqrt(XDiff * XDiff + YDiff * YDiff)),
+        NX0 is round(X + (XDiff / Dist) * Steps),
+        NY0 is round(Y + (YDiff / Dist) * Steps),
+        y_lane(Name, MinY, MaxY),
+        clamp(NX0, MinX, MaxX, NewX),
+        clamp(NY0, MinY, MaxY, NewY),
+        update_position(Name, NewX, NewY),
+        update_stamina(Name, -1)
+    ).
+
+% 16. GOAL CHECKING AND RESTARTS
+
+
+% Decide whether the ball crossing an end line becomes a goal event or a goal kick.
+check_goal :-
+    ball(position(BX, BY), _),
+    ( BX >= 200 ->
+        ( half(1) -> DefTeam = team2, AttTeam = team1
+        ;            DefTeam = team1, AttTeam = team2 ),
+        ( BY >= 50, BY =< 90 ->
+            safe(handle_line_event(DefTeam, AttTeam))
+        ;
+            goal_kick(DefTeam)
+        )
+    ; BX =< 0 ->
+        ( half(1) -> DefTeam = team1, AttTeam = team2
+        ;            DefTeam = team2, AttTeam = team1 ),
+        ( BY >= 50, BY =< 90 ->
+            safe(handle_line_event(DefTeam, AttTeam))
+        ;
+            goal_kick(DefTeam)
+        )
+    ; true
+    ).
+
+
+% Give the ball back to the defending goalkeeper after a missed shot.
+goal_kick(DefTeam) :-
+    player(GKName, DefTeam, goalkeeper, position(GKX, GKY), _, _, _, _),
+    !,
+    retractall(ball_velocity(_, _)),
+    retractall(ball(_, _)),
+    assertz(ball(position(GKX, GKY), GKName)),
+    atomic_list_concat(['Goal kick — ', GKName], M),
+    set_msg(M).
+
+% Resolve what happens when the ball reaches the goal line inside the goal mouth.
+
+handle_line_event(DefTeam, AttTeam) :-
+    player(GKName, DefTeam, goalkeeper, position(GKX, GKY), _, _, _, GKIntercept),
+    !,
+    SaveThreshold is round(GKIntercept * 0.25),
+    random(0, 100, R),
+    ( R < SaveThreshold ->
+        retractall(ball_velocity(_, _)),
+        retractall(ball(_, _)),
+        assertz(ball(position(GKX, GKY), GKName)),
+        retractall(gk_hold_count(DefTeam, _)),
+        assertz(gk_hold_count(DefTeam, 2)),
+        atomic_list_concat(['SAVED by ', GKName, '!'], SM),
+        set_msg(SM)
+    ;
+        retract(score(AttTeam, OldS)),
+        NewS is OldS + 1,
+        assertz(score(AttTeam, NewS)),
+        ( AttTeam = team1 -> TeamLabel = 'Team 1' ; TeamLabel = 'Team 2' ),
+        atomic_list_concat(['GOAL!  ', TeamLabel, ' scores!'], GM),
+        set_msg(GM),
+        retractall(kickoff_team(_)),
+        assertz(kickoff_team(DefTeam)),
+        assertz(goal_delay),
+        new(GT, timer(1.5, message(@prolog, do_goal_reset))),
+        assertz(delay_timer(GT)),
+        send(GT, start)
+    ).
+
+% do_goal_reset/0:
+% Finish the post-goal pause and put players into restart positions.
+do_goal_reset :-
+    forall(delay_timer(T), ( object(T) -> send(T, stop) ; true )),
+    retractall(delay_timer(_)),
+    retractall(goal_delay),
+    ( half(2) -> reset_positions_second_half ; reset_positions ),
+    redraw_canvas.
+
+
+% 17. REDRAW CYCLE
+
+
+% Rebuild the visible frame.
+% keeps drawing simple and avoids stale objects hanging around.
+redraw_canvas :-
+    gui_canvas(Pic),
+    object(Pic),
+    !,
+    clear_live_gfx,
+    safe(draw_field(Pic)),
+    safe(draw_header(Pic)),
+    ( show_overlay(halftime) ->
+        safe(draw_halftime_overlay(Pic))
+    ;
+        safe(draw_players(Pic)),
+        safe(draw_ball_marker(Pic))
+    ).
+redraw_canvas.
+
+% 18. DRAW HELPERS
+
+dp(Win, Obj, Pt) :-
+    assertz(live_gfx(Obj)),
+    send(Win, display, Obj, Pt).
+
+
+% Remove every drawing object created in the previous frame.
+clear_live_gfx :-
+    findall(G, live_gfx(G), Gs),
+    retractall(live_gfx(_)),
+    free_gfx_list(Gs).
+
+
+% predicate that erases and frees tracked drawing objects.
+free_gfx_list([]).
+free_gfx_list([G | Rest]) :-
+    ( object(G) ->
+        catch(send(G, erase), _, true),
+        catch(send(G, free),  _, true)
+    ; true ),
+    free_gfx_list(Rest).
+
+
+% Draw a filled rectangle.
+fb(Win, X, Y, W, H, Col) :-
+    new(B, box(W, H)),
+    send(B, fill_pattern, colour(Col)),
+    send(B, pen, 0),
+    dp(Win, B, point(X, Y)).
+
+
+% Draw a rectangle border using four thin filled bars.
+rb(Win, X, Y, W, H, T, Col) :-
+    Y2 is Y + H - T,
+    X2 is X + W - T,
+    fb(Win, X,  Y,  W, T, Col),
+    fb(Win, X,  Y2, W, T, Col),
+    fb(Win, X,  Y,  T, H, Col),
+    fb(Win, X2, Y,  T, H, Col).
+
+% 19. FIELD DRAWING
+% Paint the pitch, goals, lines, and other stadium elements.
+
+
+
+% Draw the static stadium background for the current frame.
+draw_field(Pic) :-
+    fb(Pic, 0, 0, 920, 620, black),
+    fb(Pic, 0, 60, 920, 560, darkgreen),
+    fb(Pic, 140, 60, 80, 560, forestgreen),
+    fb(Pic, 300, 60, 80, 560, forestgreen),
+    fb(Pic, 460, 60, 80, 560, forestgreen),
+    fb(Pic, 620, 60, 80, 560, forestgreen),
+    fb(Pic, 780, 60, 80, 560, forestgreen),
+    rb(Pic, 60, 60, 800, 560, 2, white),
+    fb(Pic, 459, 60, 2, 560, white),
+    new(CC, circle(80)),
+    send(CC, pen, 2),
+    send(CC, colour, colour(white)),
+    dp(Pic, CC, point(420, 300)),
+    new(CS, circle(8)),
+    send(CS, fill_pattern, colour(white)),
+    send(CS, pen, 0),
+    dp(Pic, CS, point(456, 336)),
+    rb(Pic,  60, 172, 140, 336, 2, white),
+    rb(Pic, 720, 172, 140, 336, 2, white),
+    fb(Pic,   0, 260,  2, 160, white),
+    fb(Pic,   0, 260, 62,   2, white),
+    fb(Pic,   0, 418, 62,   2, white),
+    fb(Pic, 858, 260, 62,   2, white),
+    fb(Pic, 858, 418, 62,   2, white),
+    fb(Pic, 918, 260,  2, 160, white).
+
+% 20. HEADER DRAWING
+% Draw the scoreboard,which half, tick counter, and current action text.
+
+
+% Draw the top scoreboard band and the live action text.
+draw_header(Pic) :-
+    fb(Pic, 0,   0, 920, 60, black),
+    fb(Pic, 0,  58, 920,  2, white),
+
+    fb(Pic, 2, 2, 230, 56, blue),
+    new(T1, text('TEAM 1')),
+    send(T1, font, font(helvetica, bold, 24)),
+    send(T1, colour, colour(white)),
+    dp(Pic, T1, point(20, 14)),
+
+    fb(Pic, 688, 2, 230, 56, red),
+    new(T2, text('TEAM 2')),
+    send(T2, font, font(helvetica, bold, 24)),
+    send(T2, colour, colour(white)),
+    dp(Pic, T2, point(708, 14)),
+
+    score(team1, S1),
+    score(team2, S2),
+    atomic_list_concat([S1, '  -  ', S2], ScoreAtom),
+    new(ST, text(ScoreAtom)),
+    send(ST, font, font(helvetica, bold, 24)),
+    send(ST, colour, colour(yellow)),
+    get(ST, width, STW),
+    STX is 460 - STW // 2,
+    dp(Pic, ST, point(STX, 2)),
+
+    round_counter(Tick),
+    target_tick(Target),
+    ( half(1) -> HalfStr = '1st Half' ; HalfStr = '2nd Half' ),
+    atomic_list_concat([HalfStr, '   Tick ', Tick, ' / ', Target], TickAtom),
+    new(TT, text(TickAtom)),
+    send(TT, font, font(helvetica, bold, 9)),
+    send(TT, colour, colour(white)),
+    get(TT, width, TTW),
+    TTX is 460 - TTW // 2,
+    dp(Pic, TT, point(TTX, 30)),
+
+    ( action_msg(Msg), Msg \= '' ->
+        new(AM, text(Msg)),
+        send(AM, font, font(helvetica, bold, 9)),
+        send(AM, colour, colour(yellow)),
+        get(AM, width, AMW),
+        AMX is 460 - AMW // 2,
+        dp(Pic, AM, point(AMX, 45))
+    ; true ).
+
+
+% 21. PLAYER DRAWING
+% Draw every player marker, label, and stamina bar.
+
+
+
+% Gather all current players and draw
+draw_players(Pic) :-
+    findall(t(Nm, Tm, Rl, Pos, St),
+            player(Nm, Tm, Rl, Pos, St, _, _, _),
+            PlayerList),
+    draw_player_list(Pic, PlayerList).
+
+% predicate that draws players one by one.
+draw_player_list(_, []).
+draw_player_list(Pic, [t(Nm, Tm, Rl, Pos, St) | Rest]) :-
+    safe(draw_one_player(Pic, Nm, Tm, Rl, Pos, St)),
+    draw_player_list(Pic, Rest).
+
+% Draw one player marker with role text, name, and stamina bar.
+draw_one_player(Pic, Name, Team, Role, position(UX, UY), Stamina) :-
+    PX is round(UX * 4) + 60,
+    PY is round(UY * 4) + 60,
+    R = 11,
+    ( Team = team1 -> BodyCol = blue ; BodyCol = red ),
+    BX is PX - R,
+    BY is PY - R,
+
+    new(Body, circle(22)),
+    send(Body, fill_pattern, colour(BodyCol)),
+    send(Body, colour, colour(BodyCol)),
+    send(Body, pen, 0),
+    dp(Pic, Body, point(BX, BY)),
+
+    ( ball(_, Name) -> fb(Pic, PX - 4, PY - 4, 8, 8, yellow) ; true ),
+
+    role_abbr(Role, Abbr),
+    new(RA, text(Abbr)),
+    send(RA, font, font(helvetica, bold, 9)),
+    send(RA, colour, colour(white)),
+    get(RA, width, RAW),
+    RAX is PX - RAW // 2,
+    RAY is PY - 5,
+    dp(Pic, RA, point(RAX, RAY)),
+
+    new(NL, text(Name)),
+    send(NL, font, font(helvetica, bold, 9)),
+    send(NL, colour, colour(white)),
+    get(NL, width, NLW),
+    NLX is PX - NLW // 2,
+    NLY is PY - R - 14,
+    dp(Pic, NL, point(NLX, NLY)),
+
+    SBX is PX - R,
+    SBY is PY + R + 4,
+    fb(Pic, SBX, SBY, 22, 4, black),
+
+    BarW is max(1, (Stamina * 22) // 100),
+    ( Stamina >= 60 -> BarCol = limegreen
+    ; Stamina >= 30 -> BarCol = yellow
+    ;                  BarCol = red
+    ),
+    fb(Pic, SBX, SBY, BarW, 4, BarCol).
+
+
+% 22. BALL DRAWING
+
+
+
+% Draw the current ball marker on the field.
+draw_ball_marker(Pic) :-
+    ball(position(UX, UY), _),
+    PX is round(UX * 4) + 60,
+    PY is round(UY * 4) + 60,
+
+    ShX is PX - 7,
+    ShY is PY - 7,
+    new(BS, circle(14)),
+    send(BS, fill_pattern, colour(black)),
+    send(BS, colour, colour(black)),
+    send(BS, pen, 0),
+    dp(Pic, BS, point(ShX, ShY)),
+
+    BX is PX - 6,
+    BY is PY - 6,
+    new(BB, circle(12)),
+    send(BB, fill_pattern, colour(yellow)),
+    send(BB, colour, colour(yellow)),
+    send(BB, pen, 0),
+    dp(Pic, BB, point(BX, BY)).
+
+
+% 23. HALFTIME OVERLAY
+
+
+
+% Draw the halftime panel over the field.
+draw_halftime_overlay(Pic) :-
+    fb(Pic, 220, 210, 480, 200, black),
+    rb(Pic, 220, 210, 480, 200, 3, yellow),
+
+    new(T1, text('HALF TIME')),
+    send(T1, font, font(helvetica, bold, 42)),
+    send(T1, colour, colour(yellow)),
+    get(T1, width, W1),
+    X1 is 460 - W1 // 2,
+    dp(Pic, T1, point(X1, 225)),
+
+    score(team1, S1),
+    score(team2, S2),
+    atomic_list_concat(['Team 1  ', S1, '  :  ', S2, '  Team 2'], SC),
+    new(T2, text(SC)),
+    send(T2, font, font(helvetica, bold, 26)),
+    send(T2, colour, colour(white)),
+    get(T2, width, W2),
+    X2 is 460 - W2 // 2,
+    dp(Pic, T2, point(X2, 290)),
+
+    new(T3, text('All players are fully recovered.')),
+    send(T3, font, font(helvetica, normal, 16)),
+    send(T3, colour, colour(green)),
+    get(T3, width, W3),
+    X3 is 460 - W3 // 2,
+    dp(Pic, T3, point(X3, 340)).
