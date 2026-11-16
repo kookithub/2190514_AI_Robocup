@@ -2,7 +2,7 @@
 
 A 7-vs-7 RoboCup-style football match simulator written in **SWI-Prolog**, with a live **XPCE** GUI. Every player is a rule-based agent that decides what to do from a priority list based on its role. A match goes from kickoff to halftime (teams switch sides) and on to full time, with the score, a running commentary line and each player's stamina shown on screen.
 
-I made this for the 2190514 Artificial Intelligence course. It's my own simulator written from scratch, not the official RoboCup `rcssserver`.
+We made this as a team for the 2190514 Artificial Intelligence course, with AI coding agents helping to write the code. It's our own simulator, not the official RoboCup `rcssserver`.
 
 Everything lives in one file, `robocup3` (a SWI-Prolog source file with no extension, 1,179 lines).
 
