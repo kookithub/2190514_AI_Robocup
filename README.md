@@ -148,7 +148,6 @@ Other mechanics:
 
 - The GUI window shows the live score, half, tick counter, current action text and stamina bars (screenshots above).
 - Randomness (`random/3`) means every match differs. In one captured headless run (driver described below, not a benchmark) the match finished 2-2, with a halftime score of 1-1.
-- No batch results, logs or statistics are stored in the repo. TODO: confirm whether the original coursework had a report or recorded results.
 
 ## How to run
 
@@ -180,15 +179,12 @@ Notes:
 
 ## Project Facts (for resume)
 
-Plain facts verified from the code and from running it. Items not determinable from the repo are marked TODO.
 
 - **Course**: 2190514 – Artificial Intelligence
-- **Solo or team**: TODO: confirm. `git log` has a single commit ("Add files via upload"), so individual contributions cannot be derived.
-- **My contributions**: TODO: confirm (single upload commit, no per-author history).
 - **Language / libraries**: SWI-Prolog; XPCE (`library(pce)`) for GUI and timers; `library(random)`; `library(lists)`. No external dependencies. This is a custom Prolog simulation, not the official RoboCup `rcssserver`.
 - **Size**: 1 source file, 1,179 lines (~38 KB); about 54 distinct predicate names defined, 22 dynamic fact declarations, 14 agents (7 per team), 4 roles, 23 numbered code sections.
 - **Key features**: see Features. Two-half match with halftime side switch, stamina model, tackles and saves with probabilities, GUI with live commentary and stamina bars.
 - **Algorithms / design**: rule-based agents with a priority-ordered decision tree (Prolog clause ordering with cuts); role-based skill parameters and movement zones; distance-based threat detection (6 units), pass-target selection (nearest teammate ahead), safe-pass filtering for the keeper (no opponent within 15 units); probabilistic tackle and save resolution; velocity-based ball model for shots; dynamic-fact world state; timer-driven game loop with a re-entrancy guard (`tick_busy`) and `catch`-based fault isolation (`safe/1`) so one failing agent cannot crash the match; side-switch helper predicates (`effective_*`) to reuse logic for both halves.
-- **Measurable numbers (from code)**: pitch 200 x 140 units; match 90 ticks max, halftime at tick 45; 0.1 s per tick; tackle chance 10-90 percent; GK save threshold 20 percent at default skill; shot speed 8 units/tick; goal-kick/restart logic as above. No performance or win-rate numbers exist. TODO: confirm if any evaluation results were produced in the course.
-- **Hard problems and how solved (evident in code)**: avoiding overlapping timer ticks (busy flag); not crashing on predicate failure (`safe/1`, `catch`); reusing attack/defence logic after the side switch (`switched_team/2` and `effective_*` wrappers); keeping random movement inside role zones and lanes (`clamp/4`, `y_lane/3`); flicker-free redraw by tracking and freeing each frame's graphics (`live_gfx`). Whether these were the author's actual stated challenges: TODO: confirm.
-- **Outcome**: working, runnable simulator verified in this session; grade/award/presentation: TODO: confirm.
+- **Measurable numbers (from code)**: pitch 200 x 140 units; match 90 ticks max, halftime at tick 45; 0.1 s per tick; tackle chance 10-90 percent; GK save threshold 20 percent at default skill; shot speed 8 units/tick; goal-kick/restart logic as above. No performance or win-rate numbers exist.
+- **Hard problems and how solved (evident in code)**: avoiding overlapping timer ticks (busy flag); not crashing on predicate failure (`safe/1`, `catch`); reusing attack/defence logic after the side switch (`switched_team/2` and `effective_*` wrappers); keeping random movement inside role zones and lanes (`clamp/4`, `y_lane/3`); flicker-free redraw by tracking and freeing each frame's graphics (`live_gfx`).
+- **Outcome**: working, runnable simulator verified in this session.
